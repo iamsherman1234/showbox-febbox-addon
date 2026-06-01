@@ -207,6 +207,16 @@ function selectFiles(files, parsedId) {
     .map((item) => item.file);
 }
 
+function streamSortRank(link) {
+  const quality = String(link?.quality || '').toLowerCase();
+  if (quality === '1080p') return 10;
+  if (quality === '720p') return 20;
+  if (quality === '480p') return 30;
+  if (quality === '360p') return 40;
+  if (quality === 'org') return 90;
+  return 50;
+}
+
 function streamTitle(link, file) {
   const parts = [
     link.quality || '',
@@ -220,6 +230,7 @@ async function linksForFile(shareKey, file) {
   const links = await febboxAPI.getLinks(shareKey, file.fid);
   return (Array.isArray(links) ? links : [])
     .filter((link) => link?.url)
+    .sort((a, b) => streamSortRank(a) - streamSortRank(b))
     .map((link) => ({
       name: 'Showbox Febbox',
       title: streamTitle(link, file),
