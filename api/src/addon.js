@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
@@ -17,6 +19,7 @@ const ADDON_BASE_URL = (process.env.ADDON_BASE_URL || process.env.PUBLIC_URL || 
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 const SHARE_KEY_CACHE_TTL_MS = Number(process.env.SHARE_KEY_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const SHARE_KEY_CACHE_FILE = process.env.SHARE_KEY_CACHE_FILE || path.join(process.cwd(), 'cache', 'share-keys.json');
 const MAX_FILES_TO_LINK = Number(process.env.MAX_FILES_TO_LINK || 12);
 const MAX_TRAVERSAL_DEPTH = Number(process.env.MAX_TRAVERSAL_DEPTH || 3);
 const TARGET_STREAM_COUNT = Number(process.env.TARGET_STREAM_COUNT || MAX_FILES_TO_LINK);
@@ -27,6 +30,7 @@ const VIDEO_EXTENSIONS = new Set(['mp4', 'mkv', 'webm', 'avi', 'mov', 'm4v']);
 const showboxAPI = new ShowboxAPI();
 const febboxAPI = new FebboxAPI();
 const cache = new Map();
+const persistentShareKeyCache = loadPersistentShareKeyCache();
 
 const manifest = {
   id: 'org.showbox.febbox.addon',
@@ -53,6 +57,43 @@ function cacheGet(key) {
 
 function cacheSet(key, value, ttl = CACHE_TTL_MS) {
   cache.set(key, { value, expiresAt: Date.now() + ttl });
+  return value;
+}
+
+function loadPersistentShareKeyCache() {
+  try {
+    if (!fs.existsSync(SHARE_KEY_CACHE_FILE)) return {};
+    const data = JSON.parse(fs.readFileSync(SHARE_KEY_CACHE_FILE, 'utf8'));
+    return data && typeof data === 'object' ? data : {};
+  } catch (error) {
+    console.warn('[ShowboxFebbox] failed to load share-key cache: ' + error.message);
+    return {};
+  }
+}
+
+function savePersistentShareKeyCache() {
+  try {
+    fs.mkdirSync(path.dirname(SHARE_KEY_CACHE_FILE), { recursive: true });
+    fs.writeFileSync(SHARE_KEY_CACHE_FILE, JSON.stringify(persistentShareKeyCache, null, 2));
+  } catch (error) {
+    console.warn('[ShowboxFebbox] failed to save share-key cache: ' + error.message);
+  }
+}
+
+function persistentShareKeyGet(key) {
+  const entry = persistentShareKeyCache[key];
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    delete persistentShareKeyCache[key];
+    savePersistentShareKeyCache();
+    return null;
+  }
+  return entry.value || null;
+}
+
+function persistentShareKeySet(key, value, ttl = SHARE_KEY_CACHE_TTL_MS) {
+  persistentShareKeyCache[key] = { value, expiresAt: Date.now() + ttl };
+  savePersistentShareKeyCache();
   return value;
 }
 
@@ -272,8 +313,12 @@ async function getShareKey(item) {
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
+  const persistent = persistentShareKeyGet(cacheKey);
+  if (persistent) return cacheSet(cacheKey, persistent, SHARE_KEY_CACHE_TTL_MS);
+
   const shareKey = await showboxAPI.getFebBoxId(item.id, item.box_type);
   if (!shareKey) return cacheSet(cacheKey, null, 10 * 60 * 1000);
+  persistentShareKeySet(cacheKey, shareKey, SHARE_KEY_CACHE_TTL_MS);
   return cacheSet(cacheKey, shareKey, SHARE_KEY_CACHE_TTL_MS);
 }
 
