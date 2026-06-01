@@ -4,75 +4,98 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const FEBBOX_UI_COOKIE = process.env.FEBBOX_UI_COOKIE;
+function parseCookiePool(...values) {
+    return [...new Set(values
+        .flatMap(value => String(value || '').split(/[\n,]+/))
+        .map(value => value.trim())
+        .filter(Boolean)
+        .map(value => value.replace(/^ui=/, ''))
+    )];
+}
+
+const FEBBOX_UI_COOKIES = parseCookiePool(process.env.FEBBOX_UI_COOKIE, process.env.FEBBOX_UI_COOKIES);
 
 class FebboxAPI {
     constructor() {
         this.baseUrl = 'https://www.febbox.com';
         this.headers = this._getDefaultHeaders();
-        this._setAuthCookie(FEBBOX_UI_COOKIE);
+        this.cookies = FEBBOX_UI_COOKIES;
     }
 
-    // Set the auth cookie for requests
-    _setAuthCookie(cookie) {
-        if (!cookie) {
-            return this;
-        }
-
-        this.headers.cookie = `ui=${cookie}`;
-        return this;
-    }
-
-    // Default headers used for all requests
     _getDefaultHeaders() {
         return {
             'x-requested-with': 'XMLHttpRequest',
-            'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+            'accept': 'application/json, text/javascript, */*; q=0.01',
+            'accept-language': 'en-US,en;q=0.9',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
         };
     }
 
-    // Helper method to create the referer header for each request
     _setReferer(shareKey) {
-        this.headers.referer = `${this.baseUrl}/share/${shareKey}`;
+        this.headers.referer = this.baseUrl + '/share/' + shareKey;
     }
 
-    // Fetch JSON data from a URL
-    async _fetchJson(url, cookie = null) {
-        const headers = {
+    _authHeaders(cookie = null) {
+        return {
             ...this.headers,
-            ...(cookie ? { cookie: `ui=${cookie}` } : {})
+            ...(cookie ? { cookie: 'ui=' + cookie } : {})
         };
-
-        const response = await fetch(url, { headers });
-        if (!response.ok) throw new Error(`Error fetching data from ${url}: ${response.statusText}`);
-        return response.json();
     }
 
-    // Get the list of files from a shared folder
-    async getFileList(shareKey, parentId = 0 , cookie = null) {
-        const url = `${this.baseUrl}/file/file_share_list?share_key=${shareKey}&pwd=&parent_id=${parentId}&is_html=0`;
-        this._setReferer(shareKey);
+    async _fetchJsonOnce(url, cookie = null) {
+        const response = await fetch(url, { headers: this._authHeaders(cookie) });
+        const text = await response.text();
+        if (!response.ok) throw new Error('Error fetching data from ' + url + ': ' + response.statusText);
 
-        const data = await this._fetchJson(url , cookie);
-        return data.data.file_list;
+        try {
+            return JSON.parse(text);
+        } catch (error) {
+            if (text.includes('<title>Login - FEB</title>')) {
+                throw new Error('Febbox direct links require FEBBOX_UI_COOKIE or FEBBOX_UI_COOKIES');
+            }
+            throw error;
+        }
     }
 
-    // Get video file qualities and links from a shared video
-    async getLinks(shareKey, fid , cookie = null) {
-        const url = `${this.baseUrl}/console/video_quality_list?fid=${fid}`;
+    async _fetchJson(url, cookie = null, { authFirst = false } = {}) {
+        if (cookie) return this._fetchJsonOnce(url, cookie);
+
+        const cookieAttempts = authFirst ? this.cookies : [null, ...this.cookies];
+        let lastError = null;
+
+        for (const candidateCookie of cookieAttempts) {
+            try {
+                return await this._fetchJsonOnce(url, candidateCookie);
+            } catch (error) {
+                lastError = error;
+                if (!/FEBBOX_UI_COOKIE|Login - FEB|Unexpected token/.test(error.message)) throw error;
+            }
+        }
+
+        throw lastError || new Error('Febbox request failed');
+    }
+
+    async getFileList(shareKey, parentId = 0, cookie = null) {
+        const url = this.baseUrl + '/file/file_share_list?share_key=' + shareKey + '&pwd=&parent_id=' + parentId + '&is_html=0';
         this._setReferer(shareKey);
 
         const data = await this._fetchJson(url, cookie);
+        return data.data.file_list;
+    }
+
+    async getLinks(shareKey, fid, cookie = null) {
+        const url = this.baseUrl + '/console/video_quality_list?fid=' + fid;
+        this._setReferer(shareKey);
+
+        const data = await this._fetchJson(url, cookie, { authFirst: true });
         const htmlResponse = data.html;
 
-        // Parse HTML response and extract file qualities
         const dom = new JSDOM(htmlResponse);
         const doc = dom.window.document;
 
         return this._extractFileQualities(doc);
     }
 
-    // Extract file qualities from the parsed DOM
     _extractFileQualities(doc) {
         return Array.from(doc.querySelectorAll('.file_quality')).map(fileDiv => {
             const url = fileDiv.getAttribute('data-url');
