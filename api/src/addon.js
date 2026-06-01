@@ -16,8 +16,12 @@ const PORT = Number(process.env.PORT || process.env.API_PORT || 7019);
 const ADDON_BASE_URL = (process.env.ADDON_BASE_URL || process.env.PUBLIC_URL || '').replace(/\/+$/, '');
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000);
+const SHARE_KEY_CACHE_TTL_MS = Number(process.env.SHARE_KEY_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const MAX_FILES_TO_LINK = Number(process.env.MAX_FILES_TO_LINK || 12);
 const MAX_TRAVERSAL_DEPTH = Number(process.env.MAX_TRAVERSAL_DEPTH || 3);
+const TARGET_STREAM_COUNT = Number(process.env.TARGET_STREAM_COUNT || MAX_FILES_TO_LINK);
+const MIN_STREAM_RESOLUTION = parseResolution(process.env.MIN_STREAM_QUALITY || '0');
+const INCLUDE_ORIGINAL_STREAMS = process.env.INCLUDE_ORIGINAL_STREAMS !== '0';
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mkv', 'webm', 'avi', 'mov', 'm4v']);
 
 const showboxAPI = new ShowboxAPI();
@@ -68,6 +72,13 @@ function normalizeTitle(value) {
 
 function unique(values) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function parseResolution(value) {
+  const normalized = String(value || '').toLowerCase();
+  if (normalized === '4k') return 2160;
+  const match = normalized.match(/(\d{3,4})p?/);
+  return match ? Number(match[1]) : 0;
 }
 
 async function fetchJson(url, options = {}) {
@@ -207,13 +218,28 @@ function selectFiles(files, parsedId) {
     .map((item) => item.file);
 }
 
+function streamResolution(link) {
+  const quality = String(link?.quality || '').toLowerCase();
+  if (quality === 'org') return Infinity;
+  if (quality.includes('4k')) return 2160;
+  return parseResolution(quality);
+}
+
+function shouldKeepStream(link) {
+  const quality = String(link?.quality || '').toLowerCase();
+  if (quality === 'org') return INCLUDE_ORIGINAL_STREAMS;
+  return streamResolution(link) >= MIN_STREAM_RESOLUTION;
+}
+
 function streamSortRank(link) {
   const quality = String(link?.quality || '').toLowerCase();
-  if (quality === '1080p') return 10;
-  if (quality === '720p') return 20;
-  if (quality === '480p') return 30;
-  if (quality === '360p') return 40;
+  const resolution = streamResolution(link);
   if (quality === 'org') return 90;
+  if (resolution >= 2160) return 5;
+  if (resolution >= 1080) return 10;
+  if (resolution >= 720) return 20;
+  if (resolution >= 480) return 30;
+  if (resolution >= 360) return 40;
   return 50;
 }
 
@@ -229,7 +255,7 @@ function streamTitle(link, file) {
 async function linksForFile(shareKey, file) {
   const links = await febboxAPI.getLinks(shareKey, file.fid);
   return (Array.isArray(links) ? links : [])
-    .filter((link) => link?.url)
+    .filter((link) => link?.url && shouldKeepStream(link))
     .sort((a, b) => streamSortRank(a) - streamSortRank(b))
     .map((link) => ({
       name: 'Showbox Febbox',
@@ -239,6 +265,16 @@ async function linksForFile(shareKey, file) {
         bingeGroup: `showbox-febbox-${link.quality || 'auto'}`
       }
     }));
+}
+
+async function getShareKey(item) {
+  const cacheKey = `share-key:${item.box_type}:${item.id}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  const shareKey = await showboxAPI.getFebBoxId(item.id, item.box_type);
+  if (!shareKey) return cacheSet(cacheKey, null, 10 * 60 * 1000);
+  return cacheSet(cacheKey, shareKey, SHARE_KEY_CACHE_TTL_MS);
 }
 
 async function resolveStreams(type, id) {
@@ -256,16 +292,17 @@ async function resolveStreams(type, id) {
   const item = await findShowboxItem(meta);
   if (!item) return cacheSet(cacheKey, [], 10 * 60 * 1000);
 
-  const shareKey = await showboxAPI.getFebBoxId(item.id, item.box_type);
+  const shareKey = await getShareKey(item);
   if (!shareKey) return cacheSet(cacheKey, [], 10 * 60 * 1000);
 
   const files = selectFiles(await collectFiles(shareKey), parsedId);
   const streams = [];
 
   for (const file of files) {
-    if (streams.length >= MAX_FILES_TO_LINK) break;
+    if (streams.length >= TARGET_STREAM_COUNT) break;
     try {
       streams.push(...await linksForFile(shareKey, file));
+      if (streams.length > TARGET_STREAM_COUNT) streams.length = TARGET_STREAM_COUNT;
     } catch (error) {
       console.warn(`[ShowboxFebbox] link extraction failed for ${fileName(file)}: ${error.message}`);
       streams.push({
