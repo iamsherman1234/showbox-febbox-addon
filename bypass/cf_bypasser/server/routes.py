@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import os
 import re
 import time
 from contextlib import asynccontextmanager
@@ -19,8 +21,87 @@ from cf_bypasser.server.models import (
 # Global instances
 global_bypasser = None
 global_mirror = None
+bypass_semaphore = None
+watchdog_task = None
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_TREE_RSS_MB = 700
+DEFAULT_WATCHDOG_INTERVAL_SEC = 30
+DEFAULT_MAX_CONCURRENCY = 1
+
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def process_tree_rss_mb(root_pid: int = None) -> float:
+    root_pid = root_pid or os.getpid()
+    children = {}
+
+    for entry in os.scandir('/proc'):
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            with open(f'/proc/{pid}/stat', 'r', encoding='utf-8') as fh:
+                stat = fh.read()
+            after_comm = stat.rsplit(') ', 1)[1].split()
+            ppid = int(after_comm[1])
+        except Exception:
+            continue
+        children.setdefault(ppid, []).append(pid)
+
+    stack = [root_pid]
+    seen = set()
+    rss_pages = 0
+
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            with open(f'/proc/{pid}/statm', 'r', encoding='utf-8') as fh:
+                parts = fh.read().split()
+            rss_pages += int(parts[1])
+        except Exception:
+            pass
+        stack.extend(children.get(pid, []))
+
+    return rss_pages * os.sysconf('SC_PAGE_SIZE') / 1024 / 1024
+
+
+async def delayed_exit_for_memory(reason: str, delay: float = 1.0) -> None:
+    await asyncio.sleep(delay)
+    logger.error(f'Exiting bypass service for PM2 restart: {reason}')
+    os._exit(75)
+
+
+def schedule_memory_restart_if_needed(reason: str) -> None:
+    limit_mb = env_int('BYPASS_MAX_TREE_RSS_MB', DEFAULT_MAX_TREE_RSS_MB, 128)
+    rss_mb = process_tree_rss_mb()
+    if rss_mb > limit_mb:
+        logger.error(f'Bypass process tree RSS {rss_mb:.1f} MB exceeds {limit_mb} MB after {reason}')
+        asyncio.create_task(delayed_exit_for_memory(f'tree RSS {rss_mb:.1f} MB > {limit_mb} MB'))
+
+
+async def memory_watchdog() -> None:
+    interval = env_int('BYPASS_WATCHDOG_INTERVAL_SEC', DEFAULT_WATCHDOG_INTERVAL_SEC, 5)
+    limit_mb = env_int('BYPASS_MAX_TREE_RSS_MB', DEFAULT_MAX_TREE_RSS_MB, 128)
+    while True:
+        await asyncio.sleep(interval)
+        # A single active Camoufox browser can be large on this host. Let the request finish
+        # so normal cleanup and the post-request guard can run before deciding to restart.
+        if bypass_semaphore and bypass_semaphore.locked():
+            continue
+        rss_mb = process_tree_rss_mb()
+        if rss_mb > limit_mb:
+            logger.error(f'Bypass process tree RSS {rss_mb:.1f} MB exceeds watchdog limit {limit_mb} MB')
+            os._exit(75)
 
 
 @asynccontextmanager
@@ -28,7 +109,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     Lifespan context manager for FastAPI application startup and shutdown.
     """
-    global global_bypasser, global_mirror
+    global global_bypasser, global_mirror, bypass_semaphore, watchdog_task
     
     # Startup
     logger.info("Starting Cloudflare Bypasser Server...")
@@ -38,6 +119,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     
     # Initialize request mirror
     global_mirror = RequestMirror(global_bypasser)
+
+    max_concurrency = env_int('BYPASS_MAX_CONCURRENCY', DEFAULT_MAX_CONCURRENCY, 1)
+    bypass_semaphore = asyncio.Semaphore(max_concurrency)
+    watchdog_task = asyncio.create_task(memory_watchdog())
+    logger.info(f"Bypass concurrency limit: {max_concurrency}")
+    logger.info(f"Bypass tree RSS restart limit: {env_int('BYPASS_MAX_TREE_RSS_MB', DEFAULT_MAX_TREE_RSS_MB, 128)} MB")
     
     logger.info("Server initialization complete")
     
@@ -47,6 +134,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Shutting down Cloudflare Bypasser Server...")
     
     try:
+        if watchdog_task:
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                pass
+
         if global_mirror:
             await global_mirror.cleanup()
         
@@ -106,9 +200,12 @@ def setup_routes(app: FastAPI):
             
             # Use the global bypasser or create a new one
             bypasser = global_bypasser or CamoufoxBypasser(max_retries=retries, log=True)
+            gate = bypass_semaphore or asyncio.Semaphore(DEFAULT_MAX_CONCURRENCY)
             
             # Get cookies using the cache system
-            data = await bypasser.get_or_generate_cookies(url, proxy)
+            async with gate:
+                data = await bypasser.get_or_generate_cookies(url, proxy)
+            schedule_memory_restart_if_needed('/cookies')
             
             if not data:
                 raise HTTPException(status_code=500, detail="Failed to bypass Cloudflare protection")
@@ -161,9 +258,12 @@ def setup_routes(app: FastAPI):
             
             # Use the global bypasser or create a new one
             bypasser = global_bypasser or CamoufoxBypasser(max_retries=retries, log=True)
+            gate = bypass_semaphore or asyncio.Semaphore(DEFAULT_MAX_CONCURRENCY)
             
             # Get HTML content using the new method
-            data = await bypasser.get_or_generate_html(url, proxy, bypass_cache=bypassCookieCache)
+            async with gate:
+                data = await bypasser.get_or_generate_html(url, proxy, bypass_cache=bypassCookieCache)
+            schedule_memory_restart_if_needed('/html')
             
             if not data:
                 raise HTTPException(status_code=500, detail="Failed to bypass Cloudflare protection")

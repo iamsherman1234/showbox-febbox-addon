@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import signal
 import time
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
@@ -30,6 +31,71 @@ class CamoufoxBypasser:
         """Log message if logging is enabled."""
         if self.log:
             logging.info(message)
+
+    def child_pids(self, root_pid: int = None) -> list[int]:
+        """Return recursive child PIDs for the current process."""
+        root_pid = root_pid or os.getpid()
+        children = {}
+
+        for entry in os.scandir('/proc'):
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                with open(f'/proc/{pid}/stat', 'r', encoding='utf-8') as fh:
+                    stat = fh.read()
+                after_comm = stat.rsplit(') ', 1)[1].split()
+                ppid = int(after_comm[1])
+            except Exception:
+                continue
+            children.setdefault(ppid, []).append(pid)
+
+        result = []
+        stack = list(children.get(root_pid, []))
+        while stack:
+            pid = stack.pop()
+            result.append(pid)
+            stack.extend(children.get(pid, []))
+        return result
+
+    def cmdline(self, pid: int) -> str:
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as fh:
+                return fh.read().replace(b'\0', b' ').decode('utf-8', 'replace')
+        except Exception:
+            return ''
+
+    async def reap_driver_children(self) -> None:
+        """Terminate leaked Playwright driver children left behind by Camoufox."""
+        leaked = [
+            pid for pid in self.child_pids()
+            if 'playwright/driver' in self.cmdline(pid) and 'run-driver' in self.cmdline(pid)
+        ]
+        if not leaked:
+            return
+
+        self.log_message(f'Reaping leaked Playwright driver children: {leaked}')
+        for pid in leaked:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                self.log_message(f'Error terminating leaked driver {pid}: {e}')
+
+        await asyncio.sleep(1)
+
+        for pid in leaked:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                self.log_message(f'Error killing leaked driver {pid}: {e}')
 
     def parse_proxy(self, proxy: str) -> Optional[Dict[str, str]]:
         """Parse proxy URL and return proxy configuration."""
@@ -94,23 +160,25 @@ class CamoufoxBypasser:
             else:
                 self.log_message("Failed to parse proxy, continuing without proxy")
 
-        # Use global lock to serialize browser initialization (browserforge is not thread-safe)
+        # Use global lock to serialize browser initialization (browserforge is not thread-safe).
+        # Keep the AsyncCamoufox context manager so cleanup can close the driver process.
+        camoufox = AsyncCamoufox(
+            headless=True,
+            geoip=True if proxy else False,
+            humanize=False,
+            os=selected_os,
+            locale=lang if lang else "en-US",
+            i_know_what_im_doing=True,
+            config={'forceScopeAccess': True, **random_config},
+            disable_coop=True,
+            main_world_eval=True,
+            addons=[os.path.abspath(ADDON_PATH)],
+            block_images=False,
+            block_webrtc=True,
+            enable_cache=False,
+        )
         async with get_browser_init_lock():
-            browser = await AsyncCamoufox(
-                headless=True,
-                geoip=True if proxy else False,
-                humanize=False,
-                os=selected_os,
-                locale=lang if lang else "en-US",
-                i_know_what_im_doing=True,
-                config={'forceScopeAccess': True, **random_config},
-                disable_coop=True,
-                main_world_eval=True,
-                addons=[os.path.abspath(ADDON_PATH)],
-                block_images=False,
-                block_webrtc=True,
-                enable_cache=False,
-            ).__aenter__()
+            browser = await camoufox.__aenter__()
 
         # Create context with proxy if provided
         context_options = {}
@@ -120,7 +188,7 @@ class CamoufoxBypasser:
         context = await browser.new_context(**context_options)
         page = await context.new_page()
         
-        return browser, context, page
+        return camoufox, browser, context, page
 
     async def is_bypassed(self, page) -> bool:
         """Check if Cloudflare challenge has been bypassed."""
@@ -257,13 +325,14 @@ class CamoufoxBypasser:
         self.log_message(f"No cached cookies for {cache_key}, generating new ones...")
         
         # Create isolated browser instance
+        camoufox = None
         browser = None
         context = None
         page = None
         
         try:
             # Setup browser and solve challenge
-            browser, context, page = await self.setup_browser(proxy)
+            camoufox, browser, context, page = await self.setup_browser(proxy)
             
             if await self.solve_cloudflare_challenge(url, page):
                 data = await self.get_cookies_and_user_agent(context, page)
@@ -278,7 +347,7 @@ class CamoufoxBypasser:
             self.log_message(f"Error in get_or_generate_cookies: {e}")
             return None
         finally:
-            await self.cleanup_browser(browser, context, page)
+            await self.cleanup_browser(camoufox, browser, context, page)
 
     async def get_or_generate_html(self, url: str, proxy: Optional[str] = None, bypass_cache: bool = False) -> Optional[Dict[str, Any]]:
         """Get HTML content along with cookies (cached or fresh)."""
@@ -300,13 +369,14 @@ class CamoufoxBypasser:
                 self.log_message(f"Found cached cookies for {url}")
 
         # Create isolated browser instance
+        camoufox = None
         browser = None
         context = None
         page = None
         
         try:
             # Setup browser and solve challenge
-            browser, context, page = await self.setup_browser(proxy, user_agent=cached_ua)
+            camoufox, browser, context, page = await self.setup_browser(proxy, user_agent=cached_ua)
             
             if cached_cookies:
                 self.log_message("Restoring cached cookies...")
@@ -333,32 +403,43 @@ class CamoufoxBypasser:
             self.log_message(f"Error in get_or_generate_html: {e}")
             return None
         finally:
-            await self.cleanup_browser(browser, context, page)
+            await self.cleanup_browser(camoufox, browser, context, page)
 
-    async def cleanup_browser(self, browser, context, page) -> None:
+    async def cleanup_browser(self, camoufox, browser, context, page) -> None:
         """Clean up browser resources."""
         try:
-            # Close page first
+            # Close page first.
             if page:
                 try:
                     await page.close()
                 except Exception as e:
                     self.log_message(f"Error closing page: {e}")
-                
-            # Close context second
+
+            # Close context second.
             if context:
                 try:
                     await context.close()
                 except Exception as e:
                     self.log_message(f"Error closing context: {e}")
-                
-            # Close browser last
+
+            # Ask the browser to close before leaving the Camoufox manager.
             if browser:
                 try:
-                    await browser.__aexit__(None, None, None)
+                    await browser.close()
                 except Exception as e:
                     self.log_message(f"Error closing browser: {e}")
-                    
+
+            # Close the original AsyncCamoufox context manager last. This owns the driver process.
+            if camoufox:
+                try:
+                    await camoufox.__aexit__(None, None, None)
+                except Exception as e:
+                    self.log_message(f"Error closing Camoufox manager: {e}")
+
+            # Camoufox/Playwright can leave run-driver children behind on this host.
+            # Requests are serialized by the API layer, so reaping children here is safe.
+            await self.reap_driver_children()
+
         except Exception as e:
             self.log_message(f"Error during cleanup: {e}")
 
