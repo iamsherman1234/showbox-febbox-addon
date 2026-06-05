@@ -18,6 +18,7 @@ const PORT = Number(process.env.PORT || process.env.API_PORT || 7019);
 const ADDON_BASE_URL = (process.env.ADDON_BASE_URL || process.env.PUBLIC_URL || '').replace(/\/+$/, '');
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000);
+const NEGATIVE_STREAM_CACHE_TTL_MS = Number(process.env.NEGATIVE_STREAM_CACHE_TTL_MS || 2 * 60 * 1000);
 const SHARE_KEY_CACHE_TTL_MS = Number(process.env.SHARE_KEY_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const SHARE_KEY_CACHE_FILE = process.env.SHARE_KEY_CACHE_FILE || path.join(process.cwd(), 'cache', 'share-keys.json');
 const MAX_FILES_TO_LINK = Number(process.env.MAX_FILES_TO_LINK || 12);
@@ -341,24 +342,20 @@ async function resolveStreams(type, id) {
   if (!shareKey) return cacheSet(cacheKey, [], 10 * 60 * 1000);
 
   const files = selectFiles(await collectFiles(shareKey), parsedId);
-  const streams = [];
-
-  for (const file of files) {
-    if (streams.length >= TARGET_STREAM_COUNT) break;
+  const streams = (await Promise.all(files.map(async (file) => {
     try {
-      streams.push(...await linksForFile(shareKey, file));
-      if (streams.length > TARGET_STREAM_COUNT) streams.length = TARGET_STREAM_COUNT;
+      return await linksForFile(shareKey, file);
     } catch (error) {
       console.warn(`[ShowboxFebbox] link extraction failed for ${fileName(file)}: ${error.message}`);
-      streams.push({
+      return [{
         name: "Showbox Febbox",
         title: `Open Febbox\n${fileName(file)}\n${error.message}`,
         externalUrl: `https://www.febbox.com/share/${shareKey}`
-      });
+      }];
     }
-  }
+  }))).flat().slice(0, TARGET_STREAM_COUNT);
 
-  return cacheSet(cacheKey, streams);
+  return cacheSet(cacheKey, streams, streams.length ? CACHE_TTL_MS : NEGATIVE_STREAM_CACHE_TTL_MS);
 }
 
 builder.defineStreamHandler(async ({ type, id }) => {
