@@ -26,6 +26,10 @@ const MAX_TRAVERSAL_DEPTH = Number(process.env.MAX_TRAVERSAL_DEPTH || 3);
 const TARGET_STREAM_COUNT = Number(process.env.TARGET_STREAM_COUNT || MAX_FILES_TO_LINK);
 const MIN_STREAM_RESOLUTION = parseResolution(process.env.MIN_STREAM_QUALITY || '0');
 const INCLUDE_ORIGINAL_STREAMS = process.env.INCLUDE_ORIGINAL_STREAMS !== '0';
+const USE_MEDIAFLOW_PROXY = process.env.USE_MEDIAFLOW_PROXY === '1';
+const MEDIAFLOW_URL = (process.env.MEDIAFLOW_URL || 'https://proxy.sudolocal.qzz.io').replace(/\/+$/, '');
+const MEDIAFLOW_PASSWORD = process.env.MEDIAFLOW_PASSWORD || '';
+const PROXY_ORIGINAL_STREAMS = process.env.PROXY_ORIGINAL_STREAMS === '1';
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mkv', 'webm', 'avi', 'mov', 'm4v']);
 
 const showboxAPI = new ShowboxAPI();
@@ -294,6 +298,23 @@ function streamTitle(link, file) {
   return parts.join('\n');
 }
 
+
+function isOriginalStream(link) {
+  return String(link?.quality || '').toLowerCase() === 'org';
+}
+
+function mediaflowProxyUrl(link) {
+  const originalUrl = link?.url;
+  if (!USE_MEDIAFLOW_PROXY || !MEDIAFLOW_PASSWORD || !originalUrl) return originalUrl;
+
+  if (isOriginalStream(link)) {
+    if (!PROXY_ORIGINAL_STREAMS) return originalUrl;
+    return MEDIAFLOW_URL + '/proxy/stream?url=' + encodeURIComponent(originalUrl) + '&api_password=' + encodeURIComponent(MEDIAFLOW_PASSWORD);
+  }
+
+  return MEDIAFLOW_URL + '/proxy/hls/manifest.m3u8?d=' + encodeURIComponent(originalUrl) + '&api_password=' + encodeURIComponent(MEDIAFLOW_PASSWORD);
+}
+
 async function linksForFile(shareKey, file) {
   const links = await febboxAPI.getLinks(shareKey, file.fid);
   return (Array.isArray(links) ? links : [])
@@ -302,7 +323,7 @@ async function linksForFile(shareKey, file) {
     .map((link) => ({
       name: 'Showbox Febbox',
       title: streamTitle(link, file),
-      url: link.url,
+      url: mediaflowProxyUrl(link),
       behaviorHints: {
         bingeGroup: `showbox-febbox-${link.quality || 'auto'}`
       }
@@ -327,7 +348,8 @@ async function resolveStreams(type, id) {
   const parsedId = parseStremioId(id);
   if (!/^tt\d+/.test(parsedId.imdbId)) return [];
 
-  const cacheKey = `streams:${type}:${id}`;
+  const proxyMode = USE_MEDIAFLOW_PROXY ? `mediaflow:${PROXY_ORIGINAL_STREAMS ? 'all' : 'hls'}:${MEDIAFLOW_URL}` : 'direct';
+  const cacheKey = `streams:${proxyMode}:${type}:${id}`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
