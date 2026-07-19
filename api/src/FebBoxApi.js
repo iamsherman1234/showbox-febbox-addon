@@ -30,14 +30,24 @@ function loadStoredCookies() {
     }
 }
 
-function jwtExpiresSoon(cookie) {
+function decodeCookie(cookie) {
     try {
         const payload = JSON.parse(Buffer.from(cookie.split('.')[1], 'base64url').toString('utf8'));
-        return Number(payload.exp) > 0
-            && Number(payload.exp) <= Math.floor(Date.now() / 1000) + COOKIE_EXPIRY_SKEW_SECONDS;
+        return {
+            uid: payload?.data?.uid || null,
+            exp: payload?.exp || null,
+            clientId: payload?.data?.client_id || null,
+            cookie: cookie
+        };
     } catch {
-        return false;
+        return null;
     }
+}
+
+function jwtExpiresSoon(cookie) {
+    const decoded = decodeCookie(cookie);
+    if (!decoded || !decoded.exp) return false;
+    return Number(decoded.exp) <= Math.floor(Date.now() / 1000) + COOKIE_EXPIRY_SKEW_SECONDS;
 }
 
 class FebboxAPI {
@@ -52,17 +62,86 @@ class FebboxAPI {
     }
 
     replaceCookies(values) {
-        const cookies = parseCookiePool(values);
-        if (!cookies.length) throw new Error('Cannot save an empty Febbox cookie pool');
+        const newCookies = parseCookiePool(values);
+        if (!newCookies.length) throw new Error('Cannot save an empty Febbox cookie pool');
+
+        const currentCookies = loadStoredCookies();
+        const cookieMap = new Map();
+
+        for (const cookie of currentCookies) {
+            const decoded = decodeCookie(cookie);
+            const key = decoded?.uid ? String(decoded.uid) : cookie;
+            cookieMap.set(key, cookie);
+        }
+
+        for (const cookie of newCookies) {
+            const decoded = decodeCookie(cookie);
+            const key = decoded?.uid ? String(decoded.uid) : cookie;
+            cookieMap.set(key, cookie);
+        }
+
+        const mergedCookies = Array.from(cookieMap.values());
 
         const directory = path.dirname(COOKIE_FILE);
         const temporaryFile = COOKIE_FILE + '.tmp-' + process.pid;
         fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-        fs.writeFileSync(temporaryFile, JSON.stringify({ cookies }, null, 2), { mode: 0o600 });
+        fs.writeFileSync(temporaryFile, JSON.stringify({ cookies: mergedCookies }, null, 2), { mode: 0o600 });
         fs.chmodSync(temporaryFile, 0o600);
         fs.renameSync(temporaryFile, COOKIE_FILE);
         fs.chmodSync(COOKIE_FILE, 0o600);
-        this.cookies = cookies;
+
+        this.cookies = parseCookiePool(
+            mergedCookies,
+            process.env.FEBBOX_UI_COOKIE,
+            process.env.FEBBOX_UI_COOKIES
+        );
+    }
+
+    removeCookie(key) {
+        const currentCookies = loadStoredCookies();
+        const filteredCookies = currentCookies.filter(cookie => {
+            const decoded = decodeCookie(cookie);
+            const cookieKey = decoded?.uid ? String(decoded.uid) : cookie;
+            return String(cookieKey) !== String(key) && String(cookie) !== String(key);
+        });
+
+        const directory = path.dirname(COOKIE_FILE);
+        const temporaryFile = COOKIE_FILE + '.tmp-' + process.pid;
+        fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(temporaryFile, JSON.stringify({ cookies: filteredCookies }, null, 2), { mode: 0o600 });
+        fs.chmodSync(temporaryFile, 0o600);
+        fs.renameSync(temporaryFile, COOKIE_FILE);
+        fs.chmodSync(COOKIE_FILE, 0o600);
+
+        this.cookies = parseCookiePool(
+            filteredCookies,
+            process.env.FEBBOX_UI_COOKIE,
+            process.env.FEBBOX_UI_COOKIES
+        );
+    }
+
+    getAccountsInfo() {
+        return this.cookies.map(cookie => {
+            const decoded = decodeCookie(cookie);
+            if (!decoded) {
+                return {
+                    uid: 'unknown',
+                    isLegacy: true,
+                    expiresAt: 'Unknown',
+                    expired: false,
+                    cookieSummary: cookie.substring(0, 15) + '...'
+                };
+            }
+            const expiresAt = decoded.exp ? new Date(decoded.exp * 1000) : null;
+            const expired = expiresAt ? expiresAt <= new Date() : false;
+            return {
+                uid: decoded.uid,
+                isLegacy: false,
+                expiresAt: expiresAt ? expiresAt.toLocaleString() : 'Never',
+                expired: expired,
+                cookieSummary: cookie.substring(0, 15) + '...'
+            };
+        });
     }
 
     _usableCookies() {
@@ -99,9 +178,16 @@ class FebboxAPI {
         }
 
         try {
-            return JSON.parse(text);
+            const data = JSON.parse(text);
+            if (data && data.code !== undefined && data.code !== 200 && data.code !== '200' && data.code !== 1 && data.code !== '1') {
+                const errMsg = data.msg || data.message || 'Febbox API error code ' + data.code;
+                const error = new Error(errMsg);
+                error.status = Number(data.code);
+                throw error;
+            }
+            return data;
         } catch (error) {
-            if (text.includes('<title>Login - FEB</title>')) {
+            if (text.includes('<title>Login - FEB</title>') || text.includes('login-page')) {
                 throw new Error('Febbox direct links require FEBBOX_UI_COOKIE or FEBBOX_UI_COOKIES');
             }
             throw error;
@@ -124,9 +210,27 @@ class FebboxAPI {
                 return await this._fetchJsonOnce(url, candidateCookie);
             } catch (error) {
                 lastError = error;
-                const retryable = RETRYABLE_STATUSES.has(error.status)
-                    || /FEBBOX_UI_COOKIE|Login - FEB|Unexpected token/.test(error.message);
-                if (!retryable) throw error;
+                if (!candidateCookie) {
+                    const retryable = RETRYABLE_STATUSES.has(error.status)
+                        || /FEBBOX_UI_COOKIE|Login - FEB|Unexpected token/.test(error.message);
+                    if (!retryable) throw error;
+                } else {
+                    const decoded = decodeCookie(candidateCookie);
+                    console.warn(`[ShowboxFebbox] Request failed with cookie (uid: ${decoded?.uid || 'unknown'}): ${error.message}. Retrying with next cookie...`);
+                    
+                    const isAuthError = error.status === 401 
+                        || error.status === 403 
+                        || /Please login|login/i.test(error.message)
+                        || /require.*cookie/i.test(error.message);
+                    if (isAuthError) {
+                        try {
+                            this.removeCookie(candidateCookie);
+                            console.info(`[ShowboxFebbox] Permanently invalid cookie (uid: ${decoded?.uid || 'unknown'}) removed from cookie pool.`);
+                        } catch (removeErr) {
+                            console.error(`[ShowboxFebbox] Failed to remove invalid cookie: ${removeErr.message}`);
+                        }
+                    }
+                }
             }
         }
 
