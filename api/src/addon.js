@@ -909,6 +909,7 @@ app.post('/auth/febbox', (req, res) => {
   const authorizeUrl = new URL('https://www.febbox.com/login/google');
   authorizeUrl.searchParams.set('client_id', FEBBOX_CLIENT_ID);
   authorizeUrl.searchParams.set('jump', callbackUrl);
+  authorizeUrl.searchParams.set('prompt', 'select_account');
   return res.redirect(302, authorizeUrl.toString());
 });
 
