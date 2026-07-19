@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
@@ -30,11 +31,15 @@ const USE_MEDIAFLOW_PROXY = process.env.USE_MEDIAFLOW_PROXY === '1';
 const MEDIAFLOW_URL = (process.env.MEDIAFLOW_URL || 'https://proxy.sudolocal.qzz.io').replace(/\/+$/, '');
 const MEDIAFLOW_PASSWORD = process.env.MEDIAFLOW_PASSWORD || '';
 const PROXY_ORIGINAL_STREAMS = process.env.PROXY_ORIGINAL_STREAMS === '1';
+const FEBBOX_CLIENT_ID = String(process.env.FEBBOX_CLIENT_ID || '').trim();
+const FEBBOX_AUTH_SECRET = String(process.env.FEBBOX_AUTH_SECRET || '');
+const FEBBOX_AUTH_STATE_TTL_MS = Number(process.env.FEBBOX_AUTH_STATE_TTL_MS || 10 * 60 * 1000);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mkv', 'webm', 'avi', 'mov', 'm4v']);
 
 const showboxAPI = new ShowboxAPI();
 const febboxAPI = new FebboxAPI();
 const cache = new Map();
+const febboxAuthStates = new Map();
 const persistentShareKeyCache = loadPersistentShareKeyCache();
 
 const manifest = {
@@ -398,8 +403,132 @@ function requestBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
+function secretsMatch(receivedValue) {
+  const expected = Buffer.from(FEBBOX_AUTH_SECRET);
+  const received = Buffer.from(String(receivedValue || ''));
+  return expected.length > 0
+    && expected.length === received.length
+    && crypto.timingSafeEqual(expected, received);
+}
+
+function requestCookie(req, name) {
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const [key, ...valueParts] = part.trim().split('=');
+    if (key !== name) continue;
+    try {
+      return decodeURIComponent(valueParts.join('='));
+    } catch {
+      return valueParts.join('=');
+    }
+  }
+  return '';
+}
+
+function pruneFebboxAuthStates() {
+  const now = Date.now();
+  for (const [state, expiresAt] of febboxAuthStates) {
+    if (expiresAt <= now) febboxAuthStates.delete(state);
+  }
+}
+
 const app = express();
 app.use(cors());
+app.use(express.urlencoded({ extended: false, limit: '8kb' }));
+
+app.get('/auth/febbox', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+
+  if (!FEBBOX_CLIENT_ID || !FEBBOX_AUTH_SECRET) {
+    return res.status(503).type('html').send(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Febbox authorization unavailable</title></head>
+<body>
+  <h1>Febbox authorization is not configured</h1>
+  <p>Set FEBBOX_CLIENT_ID and FEBBOX_AUTH_SECRET in the addon environment.</p>
+</body>
+</html>`);
+  }
+
+  return res.type('html').send(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Renew Febbox authorization</title></head>
+<body>
+  <h1>Renew Febbox authorization</h1>
+  <p>Enter the private authorization password, then continue through Febbox/Google.</p>
+  <form method="post" action="/auth/febbox">
+    <label>Authorization password
+      <input type="password" name="secret" required autocomplete="current-password">
+    </label>
+    <button type="submit">Continue to Febbox</button>
+  </form>
+</body>
+</html>`);
+});
+
+app.post('/auth/febbox', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!FEBBOX_CLIENT_ID || !FEBBOX_AUTH_SECRET) {
+    return res.status(503).send('Febbox authorization is not configured');
+  }
+  if (!secretsMatch(req.body?.secret)) {
+    return res.status(403).send('Invalid authorization password');
+  }
+
+  pruneFebboxAuthStates();
+  const state = crypto.randomBytes(32).toString('hex');
+  febboxAuthStates.set(state, Date.now() + FEBBOX_AUTH_STATE_TTL_MS);
+  res.cookie('showbox_febbox_auth_state', state, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'lax',
+    maxAge: FEBBOX_AUTH_STATE_TTL_MS,
+    path: '/'
+  });
+
+  const callbackUrl = requestBaseUrl(req) + '/auth/febbox/callback';
+  const authorizeUrl = new URL('https://www.febbox.com/login/google');
+  authorizeUrl.searchParams.set('client_id', FEBBOX_CLIENT_ID);
+  authorizeUrl.searchParams.set('jump', callbackUrl);
+  return res.redirect(302, authorizeUrl.toString());
+});
+
+app.get('/auth/febbox/callback', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const state = requestCookie(req, 'showbox_febbox_auth_state');
+  const expiresAt = febboxAuthStates.get(state);
+  febboxAuthStates.delete(state);
+  res.clearCookie('showbox_febbox_auth_state', { path: '/' });
+
+  if (!state || !expiresAt || expiresAt <= Date.now()) {
+    return res.status(400).send('Invalid or expired Febbox authorization attempt');
+  }
+
+  const authToken = String(req.query.auth_token || req.query.auto_token || '')
+    .trim()
+    .replace(/^ui=/, '');
+  if (!authToken || authToken.length > 8192) {
+    return res.status(400).send('Febbox did not return a valid authorization token');
+  }
+
+  try {
+    febboxAPI.replaceCookies([authToken]);
+    cache.clear();
+    console.log('[ShowboxFebbox] Febbox authorization renewed successfully');
+  } catch (error) {
+    console.error('[ShowboxFebbox] failed to store Febbox authorization: ' + error.message);
+    return res.status(500).send('Failed to store Febbox authorization');
+  }
+
+  return res.type('html').send(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Febbox authorization renewed</title></head>
+<body>
+  <h1>Febbox authorization renewed</h1>
+  <p>The new cookie is active immediately. You can close this page.</p>
+</body>
+</html>`);
+});
+
 app.use('/', getRouter(builder.getInterface()));
 
 app.get('/', (req, res) => {

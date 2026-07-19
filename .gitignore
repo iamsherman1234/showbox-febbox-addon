@@ -15,6 +15,7 @@ env/
 
 # Environment Variables & Secrets
 api/cache/
+api/data/
 cf_cookie_cache.json
 .env
 .env.local
