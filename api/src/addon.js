@@ -470,6 +470,7 @@ app.use(express.urlencoded({ extended: false, limit: '8kb' }));
 
 app.get('/auth/febbox', (req, res) => {
   res.set('Cache-Control', 'no-store');
+  const callbackUrl = requestBaseUrl(req) + '/auth/febbox/callback';
 
   if (!FEBBOX_CLIENT_ID || !FEBBOX_AUTH_SECRET) {
     return res.status(503).type('html').send(`<!doctype html>
@@ -849,7 +850,27 @@ app.get('/auth/febbox', (req, res) => {
           <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4"></path></svg>
           Add / Renew Account
         </div>
+        
+        <div class="instructions" style="margin-bottom: 2rem; background: rgba(255, 255, 255, 0.02); border: 1px solid var(--card-border); padding: 1.25rem; border-radius: 16px; font-size: 0.9rem; line-height: 1.5; text-align: left;">
+          <h4 style="font-weight: 600; color: #fff; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem;">
+            <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+            How to Connect a New Account:
+          </h4>
+          <ol style="padding-left: 1.1rem; color: var(--text-muted); display: flex; flex-direction: column; gap: 0.4rem;">
+            <li>Log in to your new Google/Febbox account on <a href="https://www.febbox.com" target="_blank" style="color: var(--accent); text-decoration: none;">febbox.com</a>.</li>
+            <li>Go to <a href="https://www.febbox.com/open/clients" target="_blank" style="color: var(--accent); text-decoration: none;">febbox.com/open/clients</a> and click **Create Client**.</li>
+            <li>Use this exact **Redirect URI / Jump URL**:
+              <code style="display: block; background: rgba(0,0,0,0.3); padding: 0.4rem; border-radius: 8px; margin-top: 0.25rem; font-family: monospace; word-break: break-all; color: #a5b4fc; font-size: 0.8rem;">${callbackUrl}</code>
+            </li>
+            <li>Copy the generated **Client ID** and paste it below.</li>
+          </ol>
+        </div>
+
         <form method="post" action="/auth/febbox">
+          <div class="form-group">
+            <label for="client_id">Febbox Client ID (for this account)</label>
+            <input type="password" id="client_id" name="client_id" placeholder="Paste generated Client ID (or leave blank for default)">
+          </div>
           <div class="form-group">
             <label for="secret">Admin authorization password</label>
             <input type="password" id="secret" name="secret" required placeholder="Enter administration secret">
@@ -905,9 +926,12 @@ app.post('/auth/febbox', (req, res) => {
     path: '/'
   });
 
+  const customClientId = String(req.body?.client_id || '').trim();
+  const clientIdToUse = customClientId || FEBBOX_CLIENT_ID;
+
   const callbackUrl = requestBaseUrl(req) + '/auth/febbox/callback';
   const authorizeUrl = new URL('https://www.febbox.com/login/google');
-  authorizeUrl.searchParams.set('client_id', FEBBOX_CLIENT_ID);
+  authorizeUrl.searchParams.set('client_id', clientIdToUse);
   authorizeUrl.searchParams.set('jump', callbackUrl);
   authorizeUrl.searchParams.set('prompt', 'select_account');
   return res.redirect(302, authorizeUrl.toString());
