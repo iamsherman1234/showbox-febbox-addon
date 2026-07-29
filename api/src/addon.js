@@ -335,8 +335,8 @@ function mediaflowProxyVariants(link) {
   }
 
   const proxies = [
-    { label: 'Proxy 1', key: 'primary', url: MEDIAFLOW_URL, password: MEDIAFLOW_PASSWORD, enabled: Boolean(MEDIAFLOW_URL && MEDIAFLOW_PASSWORD) },
-    { label: 'Proxy 2', key: 'secondary', url: SECONDARY_MEDIAFLOW_URL, password: SECONDARY_MEDIAFLOW_PASSWORD, enabled: Boolean(SECONDARY_MEDIAFLOW_URL) }
+    { label: 'S10+', key: 'S10+', url: MEDIAFLOW_URL, password: MEDIAFLOW_PASSWORD, enabled: Boolean(MEDIAFLOW_URL && MEDIAFLOW_PASSWORD) },
+    { label: 'Render', key: 'Render', url: SECONDARY_MEDIAFLOW_URL, password: SECONDARY_MEDIAFLOW_PASSWORD, enabled: Boolean(SECONDARY_MEDIAFLOW_URL) }
   ].filter(proxy => proxy.enabled);
 
   if (!proxies.length) return [{ label: 'Direct', key: 'direct', url: originalUrl }];
