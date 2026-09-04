@@ -73,9 +73,20 @@ function cacheGet(key) {
 }
 
 function cacheSet(key, value, ttl = CACHE_TTL_MS) {
+  if (cache.size >= 500 && !cache.has(key)) {
+    const oldest = cache.keys().next().value;
+    if (oldest) cache.delete(oldest);
+  }
   cache.set(key, { value, expiresAt: Date.now() + ttl });
   return value;
 }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of cache.entries()) {
+    if (v && v.expiresAt && v.expiresAt < now) cache.delete(k);
+  }
+}, 10 * 60 * 1000).unref();
 
 function loadPersistentShareKeyCache() {
   try {
